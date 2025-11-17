@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 import numpy as np
 from models.schemas import ForecastRequest
 from core.model_loader import get_model
@@ -59,11 +59,11 @@ async def predict(request: ForecastRequest):
         )
 
 @router.get("/health")
-async def health_check():
+async def health_check(x_api_key: str = Header(None, alias="X-API-KEY")):
     """Check if the model is loaded and API is healthy."""
     model = get_model()
     
     return {
         "status": "healthy" if model is not None else "unhealthy",
-        "model_loaded": model is not None
+        "model_loaded": model is not None,
     }
