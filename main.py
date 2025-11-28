@@ -4,14 +4,14 @@ import uvicorn
 
 from routers import forecast
 from middleware.auth import check_wms_auth
-from core.model_loader import load_model
+from core.model_loader import load_model_artifacts
 from core.config import settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Load model
     print("🚀 Starting up application...")
-    load_model()
+    load_model_artifacts()
     yield
     # Shutdown: Cleanup if needed
     print("🛑 Shutting down application...")
