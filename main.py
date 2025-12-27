@@ -1,369 +1,541 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-from contextlib import asynccontextmanager
+"""
+FastAPI Prediction Service for LSTM Demand Forecasting
+Provides endpoints for 1-day, 7-day, and 30-day demand predictions
+Supports single and multiple item predictions
+"""
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Union
 import tensorflow as tf
 import pandas as pd
 import numpy as np
-import joblib
-import json
-from datetime import datetime, timedelta
+import pickle
+from pathlib import Path
+import io
+from datetime import datetime
+from contextlib import asynccontextmanager
 
 # ============================================================================
-# Load Model & Artifacts on Startup
+# Initialize FastAPI App
 # ============================================================================
-class ModelArtifacts:
-    """Container for all model artifacts"""
-    def __init__(self):
-        self.model = None
-        self.scaler = None
-        self.le_item = None
-        self.df_original = None
-        self.feature_cols = None
-        self.metadata = None
-        self.seq_len = 30
-
-artifacts = ModelArtifacts()
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Load model
     print("🚀 Starting up application...")
-    await load_model_artifacts()
+    await load_model_and_scalers()
     yield
     # Shutdown: Cleanup if needed
     print("🛑 Shutting down application...")
 
 app = FastAPI(
-    title="Warehouse Predictive Restocking API",
-    description="LSTM-based demand forecasting for intelligent inventory management",
+    title="LSTM Demand Forecasting API",
+    description="Multi-horizon demand forecasting for warehouse-to-supermarket operations",
     version="1.0.0",
     lifespan=lifespan
 )
 
-async def load_model_artifacts():
-    """Load all model artifacts when API starts"""
+# ============================================================================
+# Global Variables (Load on Startup)
+# ============================================================================
+MODEL = None
+FEATURE_SCALER = None
+TARGET_SCALER = None
+ITEM_ID_MAPPING = None
+FEATURE_NAMES = None
+
+# ============================================================================
+# Pydantic Models for Request/Response
+# ============================================================================
+class PredictionRequest(BaseModel):
+    item_ids: List[str] = Field(..., description="List of item IDs to predict (can be single item)")
+    csv_data: Optional[str] = Field(None, description="CSV data as string (optional if using file upload)")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "item_ids": ["2010048801", "1090092001"],
+                "csv_data": None
+            }
+        }
+
+class SinglePrediction(BaseModel):
+    item_id: str
+    item_desc: Optional[str] = None
+    predicted_demand: float
+    confidence_interval_lower: Optional[float] = None
+    confidence_interval_upper: Optional[float] = None
+    last_30_days_avg: Optional[float] = None
+
+class PredictionResponse(BaseModel):
+    predictions: List[SinglePrediction]
+    forecast_horizon: str
+    model_used: str
+    timestamp: str
+    total_items: int
+    mape: float = Field(..., description="Model's Mean Absolute Percentage Error")
+
+class HealthResponse(BaseModel):
+    status: str
+    model_loaded: bool
+    available_items: int
+    timestamp: str
+
+# ============================================================================
+# Startup Event - Load Model and Scalers
+# ============================================================================
+async def load_model_and_scalers():
+    """Load model and preprocessing tools on startup"""
+    global MODEL, FEATURE_SCALER, TARGET_SCALER, ITEM_ID_MAPPING, FEATURE_NAMES
+    
+    print("="*70)
+    print("LOADING LSTM MODEL AND SCALERS")
+    print("="*70)
+    
     try:
-        print("🔄 Loading model artifacts...")
+        # Load best model
+        model_path = "models/large_batch.keras"
+        MODEL = tf.keras.models.load_model(model_path)
+        print(f"✓ Loaded model: {model_path}")
+        print(f"  Parameters: {MODEL.count_params():,}")
         
-        # Load LSTM model
-        artifacts.model = tf.keras.models.load_model("final_lstm_model.keras")
-        print("✓ Model loaded")
+        # Load scalers
+        with open('preprocessed/scaler.pkl', 'rb') as f:
+            FEATURE_SCALER = pickle.load(f)
+        print("✓ Loaded feature scaler")
         
-        # Load preprocessors
-        artifacts.scaler = joblib.load("scaler.pkl")
-        artifacts.le_item = joblib.load("label_encoder.pkl")
-        artifacts.df_original = joblib.load("df_original.pkl")
-        print("✓ Preprocessors loaded")
+        with open('preprocessed/target_scaler.pkl', 'rb') as f:
+            TARGET_SCALER = pickle.load(f)
+        print("✓ Loaded target scaler")
         
-        # Load configuration
-        with open("feature_cols.json", "r") as f:
-            artifacts.feature_cols = json.load(f)
+        with open('preprocessed/item_id_mapping.pkl', 'rb') as f:
+            mapping = pickle.load(f)
+            # Ensure all keys are strings and stripped for consistent matching
+            ITEM_ID_MAPPING = {str(k).strip(): v for k, v in mapping.items()}
+        print(f"✓ Loaded item mapping ({len(ITEM_ID_MAPPING)} items)")
         
-        with open("model_metadata.json", "r") as f:
-            artifacts.metadata = json.load(f)
-            artifacts.seq_len = artifacts.metadata["seq_length"]
+        # Load feature names
+        data = np.load('preprocessed/data.npz')
+        FEATURE_NAMES = list(data['feature_names'])
+        print(f"✓ Loaded feature names ({len(FEATURE_NAMES)} features)")
         
-        print("✅ All artifacts loaded successfully!")
-        print(f"   - Model MAPE: {artifacts.metadata['mape']:.2f}%")
-        print(f"   - Items supported: {artifacts.metadata['num_items']}")
+        print("="*70)
+        print("✅ MODEL READY FOR PREDICTIONS")
+        print("="*70)
         
     except Exception as e:
-        print(f"❌ Failed to load artifacts: {e}")
+        print(f"❌ Error loading model: {e}")
         raise
 
 # ============================================================================
-# Request/Response Models
+# Helper Functions
 # ============================================================================
-class PredictionRequest(BaseModel):
-    item_id: str
-    forecast_days: int = 7  # Default: predict next 7 days
+def preprocess_data(df: pd.DataFrame, item_ids: List[str]) -> Dict:
+    """Preprocess data for prediction"""
     
-class ReorderRecommendation(BaseModel):
-    item_id: str
-    current_stock: float
-    predicted_demand_7days: float
-    predicted_demand_14days: float
-    predicted_demand_30days: float
-    reorder_point: float
-    days_until_stockout: int
-    recommended_order_quantity: float
-    safety_stock: float
-    lead_time_days: int
-    confidence_score: float  # Based on model MAPE
+    # Convert item_ids to strings and strip whitespace
+    item_ids_clean = [str(id).strip() for id in item_ids]
     
-class BatchPredictionRequest(BaseModel):
-    item_ids: List[str]
-    forecast_days: int = 7
-
-# ============================================================================
-# Core Prediction Function
-# ============================================================================
-def predict_demand(item_id: str, days_ahead: int = 1) -> List[float]:
-    """
-    Predict demand for an item for next N days
+    # Convert DataFrame item_id to string and strip whitespace
+    df['item_id'] = df['item_id'].astype(str).str.strip()
     
-    Args:
-        item_id: Item identifier (e.g., 'ITEM0001')
-        days_ahead: Number of days to forecast (default: 1)
+    # Filter for requested items
+    df_filtered = df[df['item_id'].isin(item_ids_clean)].copy()
     
-    Returns:
-        List of predicted quantities for each day
-    """
-    try:
-        # Get item index
-        item_idx = artifacts.le_item.transform([item_id])[0]
-    except ValueError:
-        raise HTTPException(status_code=404, detail=f"Item '{item_id}' not found in training data")
+    if df_filtered.empty:
+        raise ValueError(f"No data found for items: {item_ids}")
     
-    # Get last 30 days of data (scaled)
-    df_scaled = artifacts.df_original.copy()
-    df_scaled[artifacts.feature_cols] = artifacts.scaler.transform(
-        df_scaled[artifacts.feature_cols]
-    )
+    # Ensure date column is datetime
+    df_filtered['date'] = pd.to_datetime(df_filtered['date'])
+    df_filtered = df_filtered.sort_values(['item_id', 'date'])
     
-    item_data = df_scaled[df_scaled["item_id_encoded"] == item_idx].tail(artifacts.seq_len)
+    # Add temporal features
+    df_filtered['day_of_week'] = df_filtered['date'].dt.dayofweek
+    df_filtered['is_weekend'] = (df_filtered['day_of_week'] >= 5).astype(int)
+    df_filtered['month'] = df_filtered['date'].dt.month
+    df_filtered['week_of_year'] = df_filtered['date'].dt.isocalendar().week
+    df_filtered['day_of_month'] = df_filtered['date'].dt.day
     
-    if len(item_data) < artifacts.seq_len:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient data for '{item_id}'. Need {artifacts.seq_len} days, have {len(item_data)}"
+    # Add lagged features
+    for lag in [1, 7, 30]:
+        df_filtered[f'qty_ordered_lag_{lag}'] = (
+            df_filtered.groupby('item_id')['qty_ordered']
+            .shift(lag)
+            .fillna(0)  # Handle cases with less history than the lag
         )
     
-    # Predict iteratively for multiple days
-    predictions = []
-    current_sequence = item_data[artifacts.feature_cols].values.copy()
+    # Add rolling features
+    for window in [7, 30]:
+        df_filtered[f'qty_ordered_roll_mean_{window}'] = (
+            df_filtered.groupby('item_id')['qty_ordered']
+            .transform(lambda x: x.rolling(window, min_periods=1).mean())
+        )
+        df_filtered[f'qty_ordered_roll_std_{window}'] = (
+            df_filtered.groupby('item_id')['qty_ordered']
+            .transform(lambda x: x.rolling(window, min_periods=1).std().fillna(0))
+        )
     
-    for day in range(days_ahead):
-        # Prepare input
-        seq_input = np.expand_dims(current_sequence, axis=0)
-        item_input = np.array([[item_idx]])
+    # Add days since last order
+    df_filtered['days_since_last_order'] = (
+        df_filtered.groupby('item_id')['date'].diff().dt.days.fillna(0)
+    )
+    
+    # Encode item IDs
+    df_filtered['item_id_encoded'] = df_filtered['item_id'].map(ITEM_ID_MAPPING)
+    
+    # Drop rows with NaN
+    df_filtered = df_filtered.dropna()
+    
+    return df_filtered
+
+def create_sequences(df: pd.DataFrame, seq_length: int = 30) -> Dict:
+    """Create sequences for each item"""
+    sequences = {}
+    
+    for item_id in df['item_id'].unique():
+        item_data = df[df['item_id'] == item_id].copy()
         
-         # Predict next day
-        pred_scaled = artifacts.model.predict(
-            {"seq_input": seq_input, "item_input": item_input},
-            verbose=0
-        )[0][0]
-        # Predict next day - try named-input dict first, fallback to single-array input
-        try:
-            pred_out = artifacts.model.predict(
-                {"seq_input": seq_input, "item_input": item_input},
-                verbose=0
-            )
-            pred_scaled = pred_out[0][0]
-        except Exception:
-            # Fallback: many models accept a single array input (seq only)
-            pred_out = artifacts.model.predict(seq_input, verbose=0)
-            # handle shapes like (1,1) or (1, n)
-            pred_scaled = pred_out.reshape(-1)[0]
+        if len(item_data) < seq_length:
+            print(f"⚠️ Warning: Item {item_id} has only {len(item_data)} days of data (need {seq_length})")
+            continue
+        
+        # Get last 30 days
+        last_30_days = item_data.tail(seq_length)
+        
+        # Extract features
+        sequence = last_30_days[FEATURE_NAMES].values
+        
+        # Scale features
+        sequence_scaled = FEATURE_SCALER.transform(sequence)
+        
+        # Get item encoding
+        item_id_encoded = last_30_days['item_id_encoded'].iloc[0]
+        
+        # Get item description
+        item_desc = last_30_days['item_desc'].iloc[0] if 'item_desc' in last_30_days.columns else None
+        
+        # Calculate last 30 days average
+        last_30_avg = last_30_days['qty_ordered'].mean()
+        
+        sequences[item_id] = {
+            'sequence': sequence_scaled,
+            'item_id_encoded': item_id_encoded,
+            'item_desc': item_desc,
+            'last_30_avg': last_30_avg
+        }
+    
+    return sequences
+
+def make_predictions(sequences: Dict, horizon: str) -> List[SinglePrediction]:
+    """Make predictions for all items"""
+    predictions = []
+    
+    # Prepare batch inputs
+    X_seq_batch = []
+    X_item_batch = []
+    item_ids_batch = []
+    
+    for item_id, data in sequences.items():
+        X_seq_batch.append(data['sequence'])
+        X_item_batch.append(data['item_id_encoded'])
+        item_ids_batch.append(item_id)
+    
+    if not item_ids_batch:
+        raise HTTPException(
+            status_code=400, 
+            detail="None of the requested items have enough historical data (need at least 30 days) to generate a prediction."
+        )
+    
+    # Convert to numpy arrays
+    X_seq_batch = np.array(X_seq_batch)
+    X_item_batch = np.array(X_item_batch)
+    
+    # Make predictions
+    try:
+        model_predictions = MODEL.predict([X_seq_batch, X_item_batch], verbose=0)
+        # Handle different model output formats
+        if isinstance(model_predictions, list):
+            pred_1d, pred_7d, pred_30d = model_predictions
+        else:
+            # If model returns a single array with 3 values per prediction
+            pred_1d = model_predictions[:, 0:1]
+            pred_7d = model_predictions[:, 1:2]
+            pred_30d = model_predictions[:, 2:3]
+    except Exception as e:
+        print(f"Prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Model prediction failed: {str(e)}")
+    
+    # Select appropriate horizon
+    if horizon == "1d":
+        preds = pred_1d
+        horizon_idx = 0
+    elif horizon == "7d":
+        preds = pred_7d
+        horizon_idx = 1
+    else:  # 30d
+        preds = pred_30d
+        horizon_idx = 2
+    
+    # Inverse transform predictions
+    for i, item_id in enumerate(item_ids_batch):
+        # Create array for inverse transform
+        if horizon_idx == 0:
+            transform_array = np.array([[preds[i][0], 0, 0]])
+        elif horizon_idx == 1:
+            transform_array = np.array([[0, preds[i][0], 0]])
+        else:
+            transform_array = np.array([[0, 0, preds[i][0]]])
         
         # Inverse transform
-        pred_qty = artifacts.scaler.inverse_transform(
-            np.array([[pred_scaled] + [0] * (len(artifacts.feature_cols) - 1)])
-        )[0][0]
+        pred_original = TARGET_SCALER.inverse_transform(transform_array)[0, horizon_idx]
         
-        predictions.append(max(0, pred_qty))  # Ensure non-negative
+        # Calculate confidence interval (±20% as approximation)
+        ci_lower = pred_original * 0.8
+        ci_upper = pred_original * 1.2
         
-        # Update sequence for next prediction (shift window)
-        # For simplicity, we'll just update qty_sold and keep other features constant
-        new_row = current_sequence[-1].copy()
-        new_row[0] = pred_scaled  # Update qty_sold (first feature)
-        current_sequence = np.vstack([current_sequence[1:], new_row])
+        predictions.append(SinglePrediction(
+            item_id=item_id,
+            item_desc=sequences[item_id]['item_desc'],
+            predicted_demand=float(pred_original),
+            confidence_interval_lower=float(ci_lower),
+            confidence_interval_upper=float(ci_upper),
+            last_30_days_avg=float(sequences[item_id]['last_30_avg'])
+        ))
     
     return predictions
 
 # ============================================================================
-# Reorder Point Calculation
-# ============================================================================
-def calculate_reorder_point(
-    item_id: str,
-    current_stock: float,
-    lead_time_days: int,
-    safety_factor: float = 1.5  # 1.5x safety stock for uncertainty
-) -> ReorderRecommendation:
-    """
-    Calculate intelligent reorder point based on predicted demand
-    
-    Formula:
-        Reorder Point = (Average Daily Demand × Lead Time) + Safety Stock
-        Safety Stock = Z-score × σ × sqrt(Lead Time)
-    """
-    # Get predictions for different horizons
-    pred_7days = predict_demand(item_id, days_ahead=7)
-    pred_14days = predict_demand(item_id, days_ahead=14)
-    pred_30days = predict_demand(item_id, days_ahead=30)
-    
-    total_7day = sum(pred_7days)
-    total_14day = sum(pred_14days)
-    total_30day = sum(pred_30days)
-    
-    avg_daily_demand = total_30day / 30
-    
-    # Calculate safety stock (1.5 standard deviations for ~93% service level)
-    demand_std = np.std(pred_30days)
-    safety_stock = safety_factor * demand_std * np.sqrt(lead_time_days)
-    
-    # Reorder point
-    reorder_point = (avg_daily_demand * lead_time_days) + safety_stock
-    
-    # Days until stockout
-    if avg_daily_demand > 0:
-        days_until_stockout = int(current_stock / avg_daily_demand)
-    else:
-        days_until_stockout = 999  # Very high number if no demand
-    
-    # Recommended order quantity (Economic Order Quantity simplified)
-    # Order enough to cover lead time + review period (7 days)
-    recommended_qty = avg_daily_demand * (lead_time_days + 7) + safety_stock - current_stock
-    recommended_qty = max(0, recommended_qty)  # Don't order if overstocked
-    
-    # Confidence score (inverse of MAPE)
-    confidence = max(0, 100 - artifacts.metadata['mape'])
-    
-    return ReorderRecommendation(
-        item_id=item_id,
-        current_stock=current_stock,
-        predicted_demand_7days=round(total_7day, 2),
-        predicted_demand_14days=round(total_14day, 2),
-        predicted_demand_30days=round(total_30day, 2),
-        reorder_point=round(reorder_point, 2),
-        days_until_stockout=days_until_stockout,
-        recommended_order_quantity=round(recommended_qty, 2),
-        safety_stock=round(safety_stock, 2),
-        lead_time_days=lead_time_days,
-        confidence_score=round(confidence, 2)
-    )
-
-# ============================================================================
 # API Endpoints
 # ============================================================================
-@app.get("/")
+
+@app.get("/", response_model=Dict)
 async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "LSTM Demand Forecasting API",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "predict_1d": "/predict/1-day",
+            "predict_7d": "/predict/7-day",
+            "predict_30d": "/predict/30-day",
+            "predict_all": "/predict/all-horizons"
+        },
+        "documentation": "/docs"
+    }
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
     """Health check endpoint"""
-    if not artifacts.metadata or not artifacts.le_item:
-        return {"status": "starting", "service": "Warehouse Predictive Restocking API", "model_loaded": False}
-    return {
-        "status": "online",
-        "service": "Warehouse Predictive Restocking API",
-        "model_accuracy": f"{100 - artifacts.metadata['mape']:.2f}%",
-        "items_supported": artifacts.metadata['num_items']
-    }
+    return HealthResponse(
+        status="healthy" if MODEL is not None else "unhealthy",
+        model_loaded=MODEL is not None,
+        available_items=len(ITEM_ID_MAPPING) if ITEM_ID_MAPPING else 0,
+        timestamp=datetime.now().isoformat()
+    )
 
-@app.post("/predict/demand", response_model=dict)
-async def predict_item_demand(request: PredictionRequest):
-    """
-    Predict demand for a single item over the next N days
-    
-    Example request:
-    ```json
-    {
-        "item_id": "ITEM0001",
-        "forecast_days": 7
-    }
-    ```
-    """
-    predictions = predict_demand(request.item_id, request.forecast_days)
-    
-    return {
-        "item_id": request.item_id,
-        "forecast_days": request.forecast_days,
-        "predictions": [round(p, 2) for p in predictions],
-        "total_demand": round(sum(predictions), 2),
-        "average_daily_demand": round(sum(predictions) / len(predictions), 2),
-        "confidence": round(100 - artifacts.metadata['mape'], 2)
-    }
-
-@app.post("/reorder/recommendation", response_model=ReorderRecommendation)
-async def get_reorder_recommendation(
-    item_id: str,
-    current_stock: float,
-    lead_time_days: int = 7
+@app.post("/predict/1-day", response_model=PredictionResponse)
+async def predict_1_day(
+    item_ids: str = Form(..., description="Comma-separated item IDs"),
+    file: UploadFile = File(..., description="CSV file with historical data")
 ):
-    """
-    Get intelligent reorder point recommendation
-    
-    Example: `/reorder/recommendation?item_id=ITEM0001&current_stock=50&lead_time_days=7`
-    
-    Returns reorder point, safety stock, and recommended order quantity
-    """
-    return calculate_reorder_point(item_id, current_stock, lead_time_days)
+    """Predict 1-day demand for specified items"""
+    try:
+        # Parse item IDs
+        item_id_list = [id.strip() for id in item_ids.split(',')]
+        
+        # Read CSV file
+        contents = await file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        
+        # Preprocess data
+        df_processed = preprocess_data(df, item_id_list)
+        
+        # Create sequences
+        sequences = create_sequences(df_processed)
+        
+        # Make predictions
+        predictions = make_predictions(sequences, "1d")
+        
+        return PredictionResponse(
+            predictions=predictions,
+            forecast_horizon="1-day",
+            model_used="large_batch",
+            timestamp=datetime.now().isoformat(),
+            total_items=len(predictions),
+            mape=228.2  # From model results
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/reorder/batch", response_model=List[ReorderRecommendation])
-async def batch_reorder_recommendations(
-    items: List[dict]  # [{"item_id": "ITEM0001", "current_stock": 50, "lead_time_days": 7}]
+@app.post("/predict/7-day", response_model=PredictionResponse)
+async def predict_7_day(
+    item_ids: str = Form(..., description="Comma-separated item IDs"),
+    file: UploadFile = File(..., description="CSV file with historical data")
 ):
-    """
-    Get reorder recommendations for multiple items at once
-    
-    Example request:
-    ```json
-    [
-        {"item_id": "ITEM0001", "current_stock": 50, "lead_time_days": 7},
-        {"item_id": "ITEM0002", "current_stock": 30, "lead_time_days": 5}
-    ]
-    ```
-    """
-    recommendations = []
-    for item in items:
-        try:
-            rec = calculate_reorder_point(
-                item["item_id"],
-                item["current_stock"],
-                item.get("lead_time_days", 7)
-            )
-            recommendations.append(rec)
-        except Exception as e:
-            print(f"Error processing {item['item_id']}: {e}")
-            continue
-    
-    return recommendations
+    """Predict 7-day demand for specified items"""
+    try:
+        # Parse item IDs
+        item_id_list = [id.strip() for id in item_ids.split(',')]
+        
+        # Read CSV file
+        contents = await file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        
+        # Preprocess data
+        df_processed = preprocess_data(df, item_id_list)
+        
+        # Create sequences
+        sequences = create_sequences(df_processed)
+        
+        # Make predictions
+        predictions = make_predictions(sequences, "7d")
+        
+        return PredictionResponse(
+            predictions=predictions,
+            forecast_horizon="7-day",
+            model_used="large_batch",
+            timestamp=datetime.now().isoformat(),
+            total_items=len(predictions),
+            mape=29.9  # From model results
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/items/critical", response_model=List[dict])
-async def get_critical_items(
-    threshold_days: int = 7
+@app.post("/predict/30-day", response_model=PredictionResponse)
+async def predict_30_day(
+    item_ids: str = Form(..., description="Comma-separated item IDs"),
+    file: UploadFile = File(..., description="CSV file with historical data")
 ):
-    """
-    Get list of items that need immediate restocking (stockout within threshold days)
-    
-    Example: `/items/critical?threshold_days=7`
-    """
-    # This would ideally connect to your warehouse database
-    # For now, return items from training data
-    critical_items = []
-    
-    for item_id in artifacts.le_item.classes_[:10]:  # Sample first 10 items
-        try:
-            # Get current stock from your database (mocked here)
-            current_stock = 50  # Replace with actual DB query
-            lead_time = 7
-            
-            rec = calculate_reorder_point(item_id, current_stock, lead_time)
-            
-            if rec.days_until_stockout <= threshold_days:
-                critical_items.append({
+    """Predict 30-day demand for specified items"""
+    try:
+        # Parse item IDs
+        item_id_list = [id.strip() for id in item_ids.split(',')]
+        
+        # Read CSV file
+        contents = await file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        
+        # Preprocess data
+        df_processed = preprocess_data(df, item_id_list)
+        
+        # Create sequences
+        sequences = create_sequences(df_processed)
+        
+        # Make predictions
+        predictions = make_predictions(sequences, "30d")
+        
+        return PredictionResponse(
+            predictions=predictions,
+            forecast_horizon="30-day",
+            model_used="large_batch",
+            timestamp=datetime.now().isoformat(),
+            total_items=len(predictions),
+            mape=17.1  # From model results
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict/all-horizons")
+async def predict_all_horizons(
+    item_ids: str = Form(..., description="Comma-separated item IDs"),
+    file: UploadFile = File(..., description="CSV file with historical data")
+):
+    """Predict all horizons (1-day, 7-day, 30-day) for specified items"""
+    try:
+        # Parse item IDs
+        item_id_list = [id.strip() for id in item_ids.split(',')]
+        
+        # Read CSV file
+        contents = await file.read()
+        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
+        
+        # Preprocess data
+        df_processed = preprocess_data(df, item_id_list)
+        
+        # Create sequences
+        sequences = create_sequences(df_processed)
+        
+        # Make predictions for all horizons
+        predictions_1d = make_predictions(sequences, "1d")
+        predictions_7d = make_predictions(sequences, "7d")
+        predictions_30d = make_predictions(sequences, "30d")
+        
+        # Combine results
+        combined_predictions = []
+        for i, item_id in enumerate(item_id_list):
+            if item_id in sequences:
+                combined_predictions.append({
                     "item_id": item_id,
-                    "days_until_stockout": rec.days_until_stockout,
-                    "current_stock": current_stock,
-                    "recommended_order_qty": rec.recommended_order_quantity,
-                    "urgency": "HIGH" if rec.days_until_stockout <= 3 else "MEDIUM"
+                    "item_desc": sequences[item_id]['item_desc'],
+                    "predictions": {
+                        "1_day": {
+                            "demand": predictions_1d[i].predicted_demand,
+                            "confidence_interval": [
+                                predictions_1d[i].confidence_interval_lower,
+                                predictions_1d[i].confidence_interval_upper
+                            ]
+                        },
+                        "7_day": {
+                            "demand": predictions_7d[i].predicted_demand,
+                            "confidence_interval": [
+                                predictions_7d[i].confidence_interval_lower,
+                                predictions_7d[i].confidence_interval_upper
+                            ],
+                            "reorder_point": predictions_7d[i].predicted_demand * 1.35  # With 35% safety stock
+                        },
+                        "30_day": {
+                            "demand": predictions_30d[i].predicted_demand,
+                            "confidence_interval": [
+                                predictions_30d[i].confidence_interval_lower,
+                                predictions_30d[i].confidence_interval_upper
+                            ],
+                            "recommended_order_qty": predictions_30d[i].predicted_demand
+                        }
+                    },
+                    "last_30_days_avg": sequences[item_id]['last_30_avg']
                 })
-        except:
-            continue
-    
-    return sorted(critical_items, key=lambda x: x["days_until_stockout"])
+        
+        return {
+            "predictions": combined_predictions,
+            "model_used": "large_batch",
+            "timestamp": datetime.now().isoformat(),
+            "total_items": len(combined_predictions),
+            "model_accuracy": {
+                "1_day_mape": 228.2,
+                "7_day_mape": 29.9,
+                "30_day_mape": 17.1
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/model/info")
-async def get_model_info():
-    """Get information about the deployed model"""
-    if not artifacts.metadata or not artifacts.le_item:
-        raise HTTPException(status_code=503, detail="Model artifacts not loaded yet")
+@app.get("/items", response_model=Dict)
+async def list_available_items():
+    """List all available items in the model"""
+    if ITEM_ID_MAPPING is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    # Load item mapping CSV for descriptions
+    try:
+        item_df = pd.read_csv('preprocessed/item_mapping.csv')
+        items = item_df.to_dict('records')
+    except:
+        items = [{"item_id": k, "item_id_encoded": v} for k, v in ITEM_ID_MAPPING.items()]
+    
     return {
-        "model_metadata": artifacts.metadata,
-        "supported_items": list(artifacts.le_item.classes_),
-        "features_used": artifacts.feature_cols,
-        "sequence_length": artifacts.seq_len
+        "total_items": len(items),
+        "items": items
     }
 
 # ============================================================================
-# Run with: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# Run with: uvicorn api_prediction:app --reload --port 8000
 # ============================================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

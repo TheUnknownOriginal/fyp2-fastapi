@@ -1,1 +1,0 @@
-["qty_sold", "day_of_week", "is_weekend", "promo_flag", "month", "unit_price", "lead_time_days", "stock_on_hand", "is_stocked_out", "qty_sold_lag_1", "qty_sold_lag_7", "qty_sold_lag_30", "qty_sold_roll_mean_7", "qty_sold_roll_mean_14", "qty_sold_roll_mean_30", "qty_sold_roll_std_7", "qty_sold_roll_std_14", "qty_sold_roll_std_30"]
