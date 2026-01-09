@@ -4,7 +4,7 @@ Provides endpoints for 1-day, 7-day, and 30-day demand predictions
 Supports single and multiple item predictions
 """
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Union
@@ -16,6 +16,8 @@ from pathlib import Path
 import io
 from datetime import datetime
 from contextlib import asynccontextmanager
+from sqlalchemy.orm import Session
+from database import get_db, Prediction, create_tables
 
 # ============================================================================
 # Initialize FastAPI App
@@ -23,11 +25,18 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Load model
-    print("🚀 Starting up application...")
+    print("Starting up application...")
+    # Create tables if they don't exist
+    try:
+        create_tables()
+        print("[OK] Database tables verified")
+    except Exception as e:
+        print(f"[WARNING] Could not connect to database: {e}")
+        
     await load_model_and_scalers()
     yield
     # Shutdown: Cleanup if needed
-    print("🛑 Shutting down application...")
+    print("Shutting down application...")
 
 app = FastAPI(
     title="LSTM Demand Forecasting API",
@@ -76,6 +85,15 @@ class PredictionResponse(BaseModel):
     total_items: int
     mape: float = Field(..., description="Model's Mean Absolute Percentage Error")
 
+class SavePredictionRequest(BaseModel):
+    item_id: str
+    item_desc: Optional[str] = None
+    predicted_demand: float
+    forecast_horizon: str
+    confidence_lower: Optional[float] = None
+    confidence_upper: Optional[float] = None
+    model_version: str = "v1.0"
+
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
@@ -97,35 +115,35 @@ async def load_model_and_scalers():
         # Load best model
         model_path = "models/large_batch.keras"
         MODEL = tf.keras.models.load_model(model_path)
-        print(f"✓ Loaded model: {model_path}")
+        print(f"[OK] Loaded model: {model_path}")
         print(f"  Parameters: {MODEL.count_params():,}")
         
         # Load scalers
         with open('preprocessed/scaler.pkl', 'rb') as f:
             FEATURE_SCALER = pickle.load(f)
-        print("✓ Loaded feature scaler")
+        print("[OK] Loaded feature scaler")
         
         with open('preprocessed/target_scaler.pkl', 'rb') as f:
             TARGET_SCALER = pickle.load(f)
-        print("✓ Loaded target scaler")
+        print("[OK] Loaded target scaler")
         
         with open('preprocessed/item_id_mapping.pkl', 'rb') as f:
             mapping = pickle.load(f)
             # Ensure all keys are strings and stripped for consistent matching
             ITEM_ID_MAPPING = {str(k).strip(): v for k, v in mapping.items()}
-        print(f"✓ Loaded item mapping ({len(ITEM_ID_MAPPING)} items)")
+        print(f"[OK] Loaded item mapping ({len(ITEM_ID_MAPPING)} items)")
         
         # Load feature names
         data = np.load('preprocessed/data.npz')
         FEATURE_NAMES = list(data['feature_names'])
-        print(f"✓ Loaded feature names ({len(FEATURE_NAMES)} features)")
+        print(f"[OK] Loaded feature names ({len(FEATURE_NAMES)} features)")
         
         print("="*70)
-        print("✅ MODEL READY FOR PREDICTIONS")
+        print("MODEL READY FOR PREDICTIONS")
         print("="*70)
         
     except Exception as e:
-        print(f"❌ Error loading model: {e}")
+        print(f"[ERROR] Error loading model: {e}")
         raise
 
 # ============================================================================
@@ -532,6 +550,39 @@ async def list_available_items():
         "total_items": len(items),
         "items": items
     }
+
+@app.post("/predict/save")
+async def save_prediction(
+    prediction: SavePredictionRequest,
+    db: Session = Depends(get_db)
+):
+    """Save a prediction to the database"""
+    try:
+        # Create new prediction record
+        db_prediction = Prediction(
+            item_id=prediction.item_id,
+            item_desc=prediction.item_desc,
+            predicted_demand=prediction.predicted_demand,
+            forecast_horizon=prediction.forecast_horizon,
+            confidence_lower=prediction.confidence_lower,
+            confidence_upper=prediction.confidence_upper,
+            model_version=prediction.model_version,
+            prediction_date=datetime.utcnow()
+        )
+        
+        # Add and commit
+        db.add(db_prediction)
+        db.commit()
+        db.refresh(db_prediction)
+        
+        return {
+            "status": "success",
+            "message": "Prediction saved successfully",
+            "id": db_prediction.id
+        }
+    except Exception as e:
+        print(f"Database error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save prediction: {str(e)}")
 
 # ============================================================================
 # Run with: uvicorn api_prediction:app --reload --port 8000
