@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.local
+
+# Git
+.git/
+.gitignore
+
+# Logs
+*.log
+verify_log.txt
+db_test_log.txt
+
+# Test files
+test_*.py
+*_test.py
+inspect_model.py
+
+# Documentation
+README.md
+*.md
+
+# Render
+render-build.sh
