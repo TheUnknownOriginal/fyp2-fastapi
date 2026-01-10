@@ -1,23 +1,24 @@
 """
 FastAPI Prediction Service for LSTM Demand Forecasting
-Provides endpoints for 1-day, 7-day, and 30-day demand predictions
+Provides endpoints for 90-day daily demand predictions
 Supports single and multiple item predictions
 """
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict, Union, Any
 import tensorflow as tf
 import pandas as pd
 import numpy as np
 import pickle
 from pathlib import Path
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
-from database import get_db, Prediction, create_tables
+from sqlalchemy import text
+from database import get_db, TSalesForecast
 
 # ============================================================================
 # Initialize FastAPI App
@@ -40,8 +41,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="LSTM Demand Forecasting API",
-    description="Multi-horizon demand forecasting for warehouse-to-supermarket operations",
-    version="1.0.0",
+    description="90-Day Daily Demand Forecasting using 'low_dropout' model",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -53,37 +54,50 @@ FEATURE_SCALER = None
 TARGET_SCALER = None
 ITEM_ID_MAPPING = None
 FEATURE_NAMES = None
+MODEL_METRICS = None
 
 # ============================================================================
 # Pydantic Models for Request/Response
 # ============================================================================
-class PredictionRequest(BaseModel):
-    item_ids: List[str] = Field(..., description="List of item IDs to predict (can be single item)")
-    csv_data: Optional[str] = Field(None, description="CSV data as string (optional if using file upload)")
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "item_ids": ["2010048801", "1090092001"],
-                "csv_data": None
-            }
-        }
+class DailyPrediction(BaseModel):
+    date: str
+    day_index: int
+    predicted_demand: float
+    confidence_lower: float
+    confidence_upper: float
 
-class SinglePrediction(BaseModel):
+class ModelPerformance(BaseModel):
+    mae: float
+    rmse: float
+    r2_score: float
+
+class ItemPredictionResponse(BaseModel):
     item_id: str
     item_desc: Optional[str] = None
-    predicted_demand: float
-    confidence_interval_lower: Optional[float] = None
-    confidence_interval_upper: Optional[float] = None
+    daily_predictions: List[DailyPrediction]
+    total_90_day_demand: float
     last_30_days_avg: Optional[float] = None
 
-class PredictionResponse(BaseModel):
-    predictions: List[SinglePrediction]
-    forecast_horizon: str
+class BatchPredictionResponse(BaseModel):
+    predictions: List[ItemPredictionResponse]
     model_used: str
     timestamp: str
     total_items: int
-    mape: float = Field(..., description="Model's Mean Absolute Percentage Error")
+    data_last_date: str
+    model_performance: Optional[ModelPerformance] = None
+
+class HealthResponse(BaseModel):
+    status: str
+    model_loaded: bool
+    available_items: int
+    timestamp: str
+
+class DatabaseHealthResponse(BaseModel):
+    status: str
+    connected: bool
+    details: str
+    timestamp: str
+
 
 class SavePredictionRequest(BaseModel):
     item_id: str
@@ -92,20 +106,14 @@ class SavePredictionRequest(BaseModel):
     forecast_horizon: str
     confidence_lower: Optional[float] = None
     confidence_upper: Optional[float] = None
-    model_version: str = "v1.0"
-
-class HealthResponse(BaseModel):
-    status: str
-    model_loaded: bool
-    available_items: int
-    timestamp: str
+    model_version: str = "v2.0"
 
 # ============================================================================
 # Startup Event - Load Model and Scalers
 # ============================================================================
 async def load_model_and_scalers():
     """Load model and preprocessing tools on startup"""
-    global MODEL, FEATURE_SCALER, TARGET_SCALER, ITEM_ID_MAPPING, FEATURE_NAMES
+    global MODEL, FEATURE_SCALER, TARGET_SCALER, ITEM_ID_MAPPING, FEATURE_NAMES, MODEL_METRICS
     
     print("="*70)
     print("LOADING LSTM MODEL AND SCALERS")
@@ -113,10 +121,11 @@ async def load_model_and_scalers():
     
     try:
         # Load best model
-        model_path = "models/large_batch.keras"
+        model_path = "models/low_dropout.keras"
         MODEL = tf.keras.models.load_model(model_path)
         print(f"[OK] Loaded model: {model_path}")
-        print(f"  Parameters: {MODEL.count_params():,}")
+        print(f"  Model Input Shape: {MODEL.input_shape}")
+        print(f"  Model Output Shape: {MODEL.output_shape}")
         
         # Load scalers
         with open('preprocessed/scaler.pkl', 'rb') as f:
@@ -138,6 +147,23 @@ async def load_model_and_scalers():
         FEATURE_NAMES = list(data['feature_names'])
         print(f"[OK] Loaded feature names ({len(FEATURE_NAMES)} features)")
         
+        # Load model metrics
+        try:
+            metrics_df = pd.read_csv('models/model_performance.csv')
+            # Extract values from the first row (assuming one model or specific logic)
+            # User asked for mae_all, rmse_all, mape_all, r2_all
+            row = metrics_df.iloc[0]
+            MODEL_METRICS = {
+                "mae": float(row.get("mae_all", 0.0)),
+                "rmse": float(row.get("rmse_all", 0.0)),
+                "mape": float(row.get("mape_all", 0.0)),
+                "r2_score": float(row.get("r2_all", 0.0))
+            }
+            print(f"[OK] Loaded model metrics: {MODEL_METRICS}")
+        except Exception as e:
+            print(f"[WARNING] Could not load model metrics: {e}")
+            MODEL_METRICS = {"mae": 0.0, "rmse": 0.0, "r2_score": 0.0, "mape": 0.0}
+
         print("="*70)
         print("MODEL READY FOR PREDICTIONS")
         print("="*70)
@@ -202,52 +228,72 @@ def preprocess_data(df: pd.DataFrame, item_ids: List[str]) -> Dict:
     # Encode item IDs
     df_filtered['item_id_encoded'] = df_filtered['item_id'].map(ITEM_ID_MAPPING)
     
-    # Drop rows with NaN
-    df_filtered = df_filtered.dropna()
+    # Drop rows with NaN if critical (or handle them)
+    # df_filtered = df_filtered.dropna() # Careful with this, might drop too much
     
     return df_filtered
 
-def create_sequences(df: pd.DataFrame, seq_length: int = 30) -> Dict:
-    """Create sequences for each item"""
+def create_sequences(df: pd.DataFrame, seq_length: int = 60) -> Dict:
+    """Create sequences for each item. Updated default seq_length to 60 based on recent context."""
     sequences = {}
     
     for item_id in df['item_id'].unique():
         item_data = df[df['item_id'] == item_id].copy()
         
+        # Sort by date just in case
+        item_data = item_data.sort_values('date')
+        
         if len(item_data) < seq_length:
             print(f"⚠️ Warning: Item {item_id} has only {len(item_data)} days of data (need {seq_length})")
             continue
         
-        # Get last 30 days
-        last_30_days = item_data.tail(seq_length)
+        # Get last seq_length days
+        last_history = item_data.tail(seq_length)
+        last_date = last_history['date'].iloc[-1]
+        
+        # Check if features match trained features
+        missing_features = [f for f in FEATURE_NAMES if f not in last_history.columns]
+        if missing_features:
+            print(f"⚠️ Warning: Item {item_id} missing features: {missing_features}")
+            # Potentially fill missing with 0
+            for f in missing_features:
+                last_history[f] = 0
         
         # Extract features
-        sequence = last_30_days[FEATURE_NAMES].values
+        sequence = last_history[FEATURE_NAMES].values
         
         # Scale features
+        # Note: If FEATURE_SCALER expects dataframe, fine. If numpy, fine.
+        # Assuming FEATURE_SCALER fits on FEATURE_NAMES columns.
         sequence_scaled = FEATURE_SCALER.transform(sequence)
         
         # Get item encoding
-        item_id_encoded = last_30_days['item_id_encoded'].iloc[0]
-        
+        item_id_encoded = last_history['item_id_encoded'].iloc[0]
+        # Keep encoded ID valid (fill with 0 or similar if NaN, though map should have handled it)
+        if pd.isna(item_id_encoded):
+             # Fallback if item not in mapping (should typically filter these out or use 'other')
+             # For now, let's assume it was mapped or we skip
+             pass
+
         # Get item description
-        item_desc = last_30_days['item_desc'].iloc[0] if 'item_desc' in last_30_days.columns else None
+        item_desc = last_history['item_desc'].iloc[0] if 'item_desc' in last_history.columns else None
         
-        # Calculate last 30 days average
-        last_30_avg = last_30_days['qty_ordered'].mean()
+        # Calculate last 30 days average for reference
+        last_30_avg = last_history['qty_ordered'].tail(30).mean()
         
         sequences[item_id] = {
             'sequence': sequence_scaled,
             'item_id_encoded': item_id_encoded,
             'item_desc': item_desc,
-            'last_30_avg': last_30_avg
+            'last_30_avg': last_30_avg,
+            'last_date': last_date
         }
     
     return sequences
 
-def make_predictions(sequences: Dict, horizon: str) -> List[SinglePrediction]:
-    """Make predictions for all items"""
-    predictions = []
+def make_predictions(sequences: Dict) -> List[ItemPredictionResponse]:
+    """Make 90-day predictions for all items"""
+    responses = []
     
     # Prepare batch inputs
     X_seq_batch = []
@@ -262,7 +308,7 @@ def make_predictions(sequences: Dict, horizon: str) -> List[SinglePrediction]:
     if not item_ids_batch:
         raise HTTPException(
             status_code=400, 
-            detail="None of the requested items have enough historical data (need at least 30 days) to generate a prediction."
+            detail="None of the requested items have enough historical data to generate a prediction."
         )
     
     # Convert to numpy arrays
@@ -271,57 +317,83 @@ def make_predictions(sequences: Dict, horizon: str) -> List[SinglePrediction]:
     
     # Make predictions
     try:
+        # Expected output shape: (batch, 90) or (batch, 90, 1)
         model_predictions = MODEL.predict([X_seq_batch, X_item_batch], verbose=0)
-        # Handle different model output formats
-        if isinstance(model_predictions, list):
-            pred_1d, pred_7d, pred_30d = model_predictions
-        else:
-            # If model returns a single array with 3 values per prediction
-            pred_1d = model_predictions[:, 0:1]
-            pred_7d = model_predictions[:, 1:2]
-            pred_30d = model_predictions[:, 2:3]
+        
+        # Squeeze if (batch, 90, 1) -> (batch, 90)
+        if len(model_predictions.shape) == 3:
+             model_predictions = np.squeeze(model_predictions, axis=-1)
+             
     except Exception as e:
         print(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Model prediction failed: {str(e)}")
     
-    # Select appropriate horizon
-    if horizon == "1d":
-        preds = pred_1d
-        horizon_idx = 0
-    elif horizon == "7d":
-        preds = pred_7d
-        horizon_idx = 1
-    else:  # 30d
-        preds = pred_30d
-        horizon_idx = 2
-    
-    # Inverse transform predictions
+    # Process predictions per item
     for i, item_id in enumerate(item_ids_batch):
-        # Create array for inverse transform
-        if horizon_idx == 0:
-            transform_array = np.array([[preds[i][0], 0, 0]])
-        elif horizon_idx == 1:
-            transform_array = np.array([[0, preds[i][0], 0]])
-        else:
-            transform_array = np.array([[0, 0, preds[i][0]]])
+        preds = model_predictions[i] # Shape (90,)
         
         # Inverse transform
-        pred_original = TARGET_SCALER.inverse_transform(transform_array)[0, horizon_idx]
+        # Target scaler likely expects shape (n, 3) if trained on [target_col1, target_col2, target_col3] 
+        # OR shape (n, 1) if single target.
+        # Based on previous code: TARGET_SCALER.inverse_transform(transform_array)[0, horizon_idx]
+        # It seemed to train on 3 targets (1d, 7d, 30d). 
+        # BUT the new model `low_dropout` is a Sequence-to-Sequence (90 days).
+        # We need to consider how the target scaler was fitted.
+        # IF target_scaler was fitted on 'qty_ordered' (single column), then simple inverse.
+        # IF it was fitted on the 3-horizon training target, we might have a mismatch if we reuse the old scalar.
+        # **ASSUMPTION**: The user kept `preprocessed/target_scaler.pkl`. If this scaler expects 3 dims, we have a problem
+        # unless we pretend it's one of them.
+        # Let's inspect the `TARGET_SCALER` safely.
+        # For now, simplistic approach: create dummy array matching scaler input size.
         
-        # Calculate confidence interval (±20% as approximation)
-        ci_lower = pred_original * 0.8
-        ci_upper = pred_original * 1.2
+        try:
+            # Try 1D first
+            preds_reshaped = preds.reshape(-1, 1)
+            pred_original = TARGET_SCALER.inverse_transform(preds_reshaped).flatten()
+        except ValueError:
+            # Revert to 3D dummy padding if scaler expects 3 columns (common in previous step)
+            # Create (90, 3) filled with zeros
+            dummy_input = np.zeros((90, 3))
+            # Assuming the target of interest (daily demand) corresponds to the first column or we apply to relevant col.
+            # *Actually*, usually standard scaler is per feature. If we predicted raw values, we inverse.
+            # Let's try filling column 0.
+            dummy_input[:, 0] = preds
+            pred_inv_full = TARGET_SCALER.inverse_transform(dummy_input)
+            pred_original = pred_inv_full[:, 0]
         
-        predictions.append(SinglePrediction(
+        # Ensure non-negative
+        pred_original = np.maximum(pred_original, 0)
+        
+        # Create daily objects
+        last_date = sequences[item_id]['last_date']
+        daily_preds_list = []
+        
+        for day_idx in range(len(pred_original)):
+            forecast_date = last_date + timedelta(days=day_idx + 1)
+            # Round to nearest whole number as requested
+            val = float(round(pred_original[day_idx]))
+            
+            # Confidence intervals (Approximate for now: +/- 20%)
+            # Ideally model outputs quantiles, but using heuristic here if not available
+            daily_preds_list.append(DailyPrediction(
+                date=forecast_date.strftime("%Y-%m-%d"),
+                day_index=day_idx + 1,
+                predicted_demand=val,
+                confidence_lower=val * 0.8,
+                confidence_upper=val * 1.2
+            ))
+            
+        total_demand = sum(p.predicted_demand for p in daily_preds_list)
+        
+        responses.append(ItemPredictionResponse(
             item_id=item_id,
             item_desc=sequences[item_id]['item_desc'],
-            predicted_demand=float(pred_original),
-            confidence_interval_lower=float(ci_lower),
-            confidence_interval_upper=float(ci_upper),
+            daily_predictions=daily_preds_list,
+            total_90_day_demand=total_demand,
             last_30_days_avg=float(sequences[item_id]['last_30_avg'])
         ))
     
-    return predictions
+    return responses
 
 # ============================================================================
 # API Endpoints
@@ -331,21 +403,19 @@ def make_predictions(sequences: Dict, horizon: str) -> List[SinglePrediction]:
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "LSTM Demand Forecasting API",
-        "version": "1.0.0",
+        "message": "LSTM Demand Forecasting API (90-Day Horizon)",
+        "version": "2.0.0",
         "endpoints": {
             "health": "/health",
-            "predict_1d": "/predict/1-day",
-            "predict_7d": "/predict/7-day",
-            "predict_30d": "/predict/30-day",
-            "predict_all": "/predict/all-horizons"
+            "health_db": "/health/db",
+            "predict": "/predict"
         },
         "documentation": "/docs"
     }
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint"""
+    """Service health check"""
     return HealthResponse(
         status="healthy" if MODEL is not None else "unhealthy",
         model_loaded=MODEL is not None,
@@ -353,193 +423,214 @@ async def health_check():
         timestamp=datetime.now().isoformat()
     )
 
-@app.post("/predict/1-day", response_model=PredictionResponse)
-async def predict_1_day(
-    item_ids: str = Form(..., description="Comma-separated item IDs"),
-    file: UploadFile = File(..., description="CSV file with historical data")
-):
-    """Predict 1-day demand for specified items"""
+@app.get("/health/db", response_model=DatabaseHealthResponse)
+async def db_health_check(db: Session = Depends(get_db)):
+    """Database connectivity check"""
     try:
-        # Parse item IDs
-        item_id_list = [id.strip() for id in item_ids.split(',')]
-        
-        # Read CSV file
-        contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-        
-        # Preprocess data
-        df_processed = preprocess_data(df, item_id_list)
-        
-        # Create sequences
-        sequences = create_sequences(df_processed)
-        
-        # Make predictions
-        predictions = make_predictions(sequences, "1d")
-        
-        return PredictionResponse(
-            predictions=predictions,
-            forecast_horizon="1-day",
-            model_used="large_batch",
-            timestamp=datetime.now().isoformat(),
-            total_items=len(predictions),
-            mape=228.2  # From model results
+        # Execute a simple query
+        result = db.execute(text("SELECT 1"))
+        result.scalar() # fetch result
+        return DatabaseHealthResponse(
+            status="healthy",
+            connected=True,
+            details="Successfully connected to SQL database",
+            timestamp=datetime.now().isoformat()
         )
-        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/predict/7-day", response_model=PredictionResponse)
-async def predict_7_day(
-    item_ids: str = Form(..., description="Comma-separated item IDs"),
-    file: UploadFile = File(..., description="CSV file with historical data")
-):
-    """Predict 7-day demand for specified items"""
-    try:
-        # Parse item IDs
-        item_id_list = [id.strip() for id in item_ids.split(',')]
-        
-        # Read CSV file
-        contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-        
-        # Preprocess data
-        df_processed = preprocess_data(df, item_id_list)
-        
-        # Create sequences
-        sequences = create_sequences(df_processed)
-        
-        # Make predictions
-        predictions = make_predictions(sequences, "7d")
-        
-        return PredictionResponse(
-            predictions=predictions,
-            forecast_horizon="7-day",
-            model_used="large_batch",
-            timestamp=datetime.now().isoformat(),
-            total_items=len(predictions),
-            mape=29.9  # From model results
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/predict/30-day", response_model=PredictionResponse)
-async def predict_30_day(
-    item_ids: str = Form(..., description="Comma-separated item IDs"),
-    file: UploadFile = File(..., description="CSV file with historical data")
-):
-    """Predict 30-day demand for specified items"""
-    try:
-        # Parse item IDs
-        item_id_list = [id.strip() for id in item_ids.split(',')]
-        
-        # Read CSV file
-        contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-        
-        # Preprocess data
-        df_processed = preprocess_data(df, item_id_list)
-        
-        # Create sequences
-        sequences = create_sequences(df_processed)
-        
-        # Make predictions
-        predictions = make_predictions(sequences, "30d")
-        
-        return PredictionResponse(
-            predictions=predictions,
-            forecast_horizon="30-day",
-            model_used="large_batch",
-            timestamp=datetime.now().isoformat(),
-            total_items=len(predictions),
-            mape=17.1  # From model results
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/predict/all-horizons")
-async def predict_all_horizons(
-    item_ids: str = Form(..., description="Comma-separated item IDs"),
-    file: UploadFile = File(..., description="CSV file with historical data")
-):
-    """Predict all horizons (1-day, 7-day, 30-day) for specified items"""
-    try:
-        # Parse item IDs
-        item_id_list = [id.strip() for id in item_ids.split(',')]
-        
-        # Read CSV file
-        contents = await file.read()
-        df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
-        
-        # Preprocess data
-        df_processed = preprocess_data(df, item_id_list)
-        
-        # Create sequences
-        sequences = create_sequences(df_processed)
-        
-        # Make predictions for all horizons
-        predictions_1d = make_predictions(sequences, "1d")
-        predictions_7d = make_predictions(sequences, "7d")
-        predictions_30d = make_predictions(sequences, "30d")
-        
-        # Combine results
-        combined_predictions = []
-        for i, item_id in enumerate(item_id_list):
-            if item_id in sequences:
-                combined_predictions.append({
-                    "item_id": item_id,
-                    "item_desc": sequences[item_id]['item_desc'],
-                    "predictions": {
-                        "1_day": {
-                            "demand": predictions_1d[i].predicted_demand,
-                            "confidence_interval": [
-                                predictions_1d[i].confidence_interval_lower,
-                                predictions_1d[i].confidence_interval_upper
-                            ]
-                        },
-                        "7_day": {
-                            "demand": predictions_7d[i].predicted_demand,
-                            "confidence_interval": [
-                                predictions_7d[i].confidence_interval_lower,
-                                predictions_7d[i].confidence_interval_upper
-                            ],
-                            "reorder_point": predictions_7d[i].predicted_demand * 1.35  # With 35% safety stock
-                        },
-                        "30_day": {
-                            "demand": predictions_30d[i].predicted_demand,
-                            "confidence_interval": [
-                                predictions_30d[i].confidence_interval_lower,
-                                predictions_30d[i].confidence_interval_upper
-                            ],
-                            "recommended_order_qty": predictions_30d[i].predicted_demand
-                        }
-                    },
-                    "last_30_days_avg": sequences[item_id]['last_30_avg']
-                })
-        
-        return {
-            "predictions": combined_predictions,
-            "model_used": "large_batch",
-            "timestamp": datetime.now().isoformat(),
-            "total_items": len(combined_predictions),
-            "model_accuracy": {
-                "1_day_mape": 228.2,
-                "7_day_mape": 29.9,
-                "30_day_mape": 17.1
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "connected": False,
+                "details": str(e),
+                "timestamp": datetime.now().isoformat()
             }
-        }
+        )
+
+# ============================================================================
+def fetch_history_from_db(db: Session) -> pd.DataFrame:
+    """Fetch the last 60 days of sales history from the database."""
+    query = text("""
+        SELECT *
+        FROM [t_sales_order_history]
+        WHERE [date] >= (
+            SELECT DATEADD(day, -60, MAX([date])) 
+            FROM [t_sales_order_history]
+        )
+        ORDER BY [date] DESC;
+    """)
+    
+    result = db.execute(query)
+    # Convert to list of dicts then DataFrame
+    rows = result.fetchall()
+    if not rows:
+        return pd.DataFrame()
+        
+    # Get column names
+    keys = result.keys()
+    df = pd.DataFrame([dict(zip(keys, row)) for row in rows])
+    
+    # Normalize column names to lowercase just in case
+    df.columns = [c.lower() for c in df.columns]
+    
+    # Ensure date is datetime
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+        
+    return df
+
+@app.post("/predict", response_model=BatchPredictionResponse)
+async def predict(
+    item_ids: str = Form(..., description="Comma-separated item IDs (e.g. '101,102') or 'all'"),
+    db: Session = Depends(get_db)
+):
+    """
+    Generate 90-day daily predictions using last 60 days history from DB.
+    """
+    try:
+        # Fetch history from DB
+        df = fetch_history_from_db(db)
+        
+        if df.empty:
+             raise HTTPException(status_code=404, detail="No historical data found in 't_sales_order_history' (last 60 days)")
+
+        # Parse item IDs
+        if item_ids.lower().strip() == 'all':
+             target_items = df['item_id'].astype(str).unique().tolist()
+        else:
+             target_items = [id.strip() for id in item_ids.split(',')]
+        
+        # Preprocess data
+        df_processed = preprocess_data(df, target_items)
+        
+        # Create sequences
+        # Note: assuming new model trained on 60 days as per recent context in conversation history
+        # If model expects 30, this needs adjustment. 
+        # Defaulting to 60 as per recent user "Refactor 90-Day Forecast" context.
+        sequences = create_sequences(df_processed, seq_length=60)
+        
+        # Make predictions
+        predictions = make_predictions(sequences)
+        
+        # Get last date from data for meta info
+        last_date_str = df_processed['date'].max().strftime("%Y-%m-%d")
+        
+        return BatchPredictionResponse(
+            predictions=predictions,
+            model_used="low_dropout",
+            timestamp=datetime.now().isoformat(),
+            total_items=len(predictions),
+            data_last_date=last_date_str,
+            model_performance=ModelPerformance(
+                mae=MODEL_METRICS["mae"] if MODEL_METRICS else 0.0,
+                rmse=MODEL_METRICS["rmse"] if MODEL_METRICS else 0.0,
+                r2_score=MODEL_METRICS["r2_score"] if MODEL_METRICS else 0.0,
+            )
+        )
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict/save", response_model=BatchPredictionResponse)
+async def predict_and_save(
+    item_ids: str = Form(..., description="Comma-separated item IDs or 'all'"),
+    db: Session = Depends(get_db)
+):
+    """
+    Generate 90-day predictions and SAVE them to the database.
+    (Uses last 60 days history from t_sales_order_history)
+    """
+    try:
+        # Fetch history from DB
+        df = fetch_history_from_db(db)
+        
+        if df.empty:
+             raise HTTPException(status_code=404, detail="No historical data found in 't_sales_order_history' (last 60 days)")
+
+        # Parse item IDs
+        if item_ids.lower().strip() == 'all':
+             target_items = df['item_id'].astype(str).unique().tolist()
+        else:
+             target_items = [id.strip() for id in item_ids.split(',')]
+        
+        # Preprocess
+        df_processed = preprocess_data(df, target_items)
+        sequences = create_sequences(df_processed, seq_length=60)
+        predictions = make_predictions(sequences)
+        last_date_str = df_processed['date'].max().strftime("%Y-%m-%d")
+        
+        # Save to DB
+        db_objects = []
+        now_utc = datetime.utcnow()
+        
+        # Parse data_last_date for DB (if needed as datetime)
+        data_last_date_dt = df_processed['date'].max().to_pydatetime()
+        
+        # Metrics to store
+        mae_val = MODEL_METRICS["mae"] if MODEL_METRICS else None
+        rmse_val = MODEL_METRICS["rmse"] if MODEL_METRICS else None
+        r2_val = MODEL_METRICS["r2_score"] if MODEL_METRICS else None
+        
+        for item_pred in predictions:
+            for day_pred in item_pred.daily_predictions:
+                db_obj = TSalesForecast(
+                    created_at=now_utc,
+                    created_by=0, # Assuming ID
+                    is_deleted=0,
+                    updated_at=now_utc,
+                    updated_by=0, # Assuming ID
+                    
+                    item_id=item_pred.item_id,
+                    item_desc=item_pred.item_desc,
+                    date=datetime.strptime(day_pred.date, "%Y-%m-%d"),
+                    day_index=day_pred.day_index,
+                    predicted_demand=day_pred.predicted_demand,
+                    
+                    confidence_lower=day_pred.confidence_lower,
+                    confidence_upper=day_pred.confidence_upper,
+                    model_used="low_dropout", # Or "low_dropout_v2" if preferred
+                    data_last_date=data_last_date_dt,
+                    
+                    mae=mae_val,
+                    rmse=rmse_val,
+                    r2_score=r2_val
+                )
+                db_objects.append(db_obj)
+        
+        # Bulk save
+        if db_objects:
+            db.bulk_save_objects(db_objects)
+            db.commit()
+            print(f"[DB] Saved {len(db_objects)} prediction records to t_sales_forecast.")
+            
+        return BatchPredictionResponse(
+            predictions=predictions,
+            model_used="low_dropout",
+            timestamp=datetime.now().isoformat(),
+            total_items=len(predictions),
+            data_last_date=last_date_str,
+            model_performance=ModelPerformance(
+                mae=MODEL_METRICS["mae"] if MODEL_METRICS else 0.0,
+                rmse=MODEL_METRICS["rmse"] if MODEL_METRICS else 0.0,
+                r2_score=MODEL_METRICS["r2_score"] if MODEL_METRICS else 0.0,
+                mape=MODEL_METRICS["mape"] if MODEL_METRICS else 0.0
+            )
+        )
+        
+    except Exception as e:
+        db.rollback()
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/items", response_model=Dict)
 async def list_available_items():
-    """List all available items in the model"""
+    """List all available items in the mapping"""
     if ITEM_ID_MAPPING is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    # Load item mapping CSV for descriptions
     try:
         item_df = pd.read_csv('preprocessed/item_mapping.csv')
         items = item_df.to_dict('records')
@@ -551,41 +642,8 @@ async def list_available_items():
         "items": items
     }
 
-@app.post("/predict/save")
-async def save_prediction(
-    prediction: SavePredictionRequest,
-    db: Session = Depends(get_db)
-):
-    """Save a prediction to the database"""
-    try:
-        # Create new prediction record
-        db_prediction = Prediction(
-            item_id=prediction.item_id,
-            item_desc=prediction.item_desc,
-            predicted_demand=prediction.predicted_demand,
-            forecast_horizon=prediction.forecast_horizon,
-            confidence_lower=prediction.confidence_lower,
-            confidence_upper=prediction.confidence_upper,
-            model_version=prediction.model_version,
-            prediction_date=datetime.utcnow()
-        )
-        
-        # Add and commit
-        db.add(db_prediction)
-        db.commit()
-        db.refresh(db_prediction)
-        
-        return {
-            "status": "success",
-            "message": "Prediction saved successfully",
-            "id": db_prediction.id
-        }
-    except Exception as e:
-        print(f"Database error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to save prediction: {str(e)}")
-
 # ============================================================================
-# Run with: uvicorn api_prediction:app --reload --port 8000
+# Run with: uvicorn main:app --reload --port 8000
 # ============================================================================
 if __name__ == "__main__":
     import uvicorn

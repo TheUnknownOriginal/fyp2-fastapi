@@ -1,0 +1,15 @@
+Starting Verification
+Waiting for server to be ready...
+Testing Health Check (http://localhost:8000/health)...
+[OK] Health check passed
+{'status': 'healthy', 'model_loaded': True, 'available_items': 100, 'timestamp': '2026-01-11T01:08:50.574237'}
+Testing DB Health Check (http://localhost:8000/health/db)...
+[OK] DB Health check passed
+{'status': 'healthy', 'connected': True, 'details': 'Successfully connected to SQL database', 'timestamp': '2026-01-11T01:08:52.856232'}
+Testing Prediction (http://localhost:8000/predict)...
+Using test item: 100660
+[OK] Prediction successful. Received 90 daily predictions.
+[OK] Verified 90-day horizon.
+[OK] Prediction value is rounded (e.g. 43.0).
+[OK] Model Performance found: MAE=10.25434673756729, RMSE=15.09179093951336, R2=0.5943832589708524
+First prediction: {'date': '2025-05-01', 'day_index': 1, 'predicted_demand': 43.0, 'confidence_lower': 34.4, 'confidence_upper': 51.6}

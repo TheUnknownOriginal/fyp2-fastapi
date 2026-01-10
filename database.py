@@ -28,25 +28,30 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # Base class for models
 Base = declarative_base()
 
-class Prediction(Base):
-    """
-    SQLAlchemy model for storing predictions.
-    Adjust tablename and columns as needed to match your actual database schema.
-    """
-    __tablename__ = "predictions"
+class TSalesForecast(Base):
+    __tablename__ = "t_sales_forecast"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(String(50), default="system")
+    is_deleted = Column(Integer, default=0) # Using Integer for bit/bool convention if needed, or Boolean
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), default="system")
+    
     item_id = Column(String(50), nullable=False, index=True)
     item_desc = Column(String(255), nullable=True)
-    prediction_date = Column(DateTime, default=datetime.utcnow)
-    forecast_horizon = Column(String(20), nullable=False) # '1-day', '7-day', '30-day'
+    date = Column(DateTime, nullable=False)
+    day_index = Column(Integer, nullable=False)
     predicted_demand = Column(Float, nullable=False)
+    
     confidence_lower = Column(Float, nullable=True)
     confidence_upper = Column(Float, nullable=True)
-    model_version = Column(String(50), nullable=True)
+    model_used = Column(String(50), nullable=True)
+    data_last_date = Column(DateTime, nullable=True)
     
-    # Optional: raw input data or additional metadata
-    notes = Column(Text, nullable=True)
+    mae = Column(Float, nullable=True)
+    rmse = Column(Float, nullable=True)
+    r2_score = Column(Float, nullable=True)
 
 def get_db():
     """

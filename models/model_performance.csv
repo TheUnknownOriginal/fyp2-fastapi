@@ -1,0 +1,2 @@
+config_name,lstm_units,dropout,learning_rate,batch_size,embedding_dim,total_params,epochs_trained,training_time_sec,mae_all,rmse_all,mape_all,r2_all,mape_day1,mape_day7,mape_day30,mape_day90
+low_dropout,"[128, 64]",0.1,0.001,64,16,140026,27,490.87807297706604,10.25434673756729,15.09179093951336,32790277253.193195,0.5943832589708524,31857934180.7328,31167761960.522163,32798981477.39076,32299217247.062355
